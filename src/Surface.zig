@@ -168,6 +168,31 @@ search: ?Search = null,
 /// Used to rate limit BEL handling.
 last_bell_time: ?std.time.Instant = null,
 
+/// Tmux control mode state: tracks known tmux window IDs so we can
+/// diff against incoming updates and only create/remove tabs for changes.
+tmux_window_ids: TmuxWindowIdSet = .{},
+
+const TmuxWindowIdSet = struct {
+    const max = apprt.surface.Message.TmuxWindowsChanged.max_windows;
+    ids: [max]u32 = .{0} ** max,
+    count: u32 = 0,
+
+    fn contains(self: *const TmuxWindowIdSet, id: u32) bool {
+        for (self.ids[0..self.count]) |existing| {
+            if (existing == id) return true;
+        }
+        return false;
+    }
+
+    fn set(self: *TmuxWindowIdSet, new_ids: []const u32) void {
+        const n: u32 = @intCast(@min(new_ids.len, max));
+        for (new_ids[0..n], 0..n) |id, i| {
+            self.ids[i] = id;
+        }
+        self.count = n;
+    }
+};
+
 /// The effect of an input event. This can be used by callers to take
 /// the appropriate action after an input event. For example, key
 /// input can be forwarded to the OS for further processing if it
@@ -1155,6 +1180,48 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 "tmux control mode: {} window(s) in session",
                 .{info.window_count},
             );
+
+            const new_ids = info.window_ids[0..info.window_count];
+
+            // Count how many windows are new (not in our current set).
+            var new_count: u32 = 0;
+            for (new_ids) |id| {
+                if (!self.tmux_window_ids.contains(id)) {
+                    new_count += 1;
+                }
+            }
+
+            // Create a new tab for each new tmux window beyond the first
+            // one we've ever seen (the first window maps to the current
+            // surface). On the very first event our tracked count is 0
+            // so we skip the first new window.
+            const skip_first = self.tmux_window_ids.count == 0;
+            var skipped = false;
+            for (new_ids) |id| {
+                if (self.tmux_window_ids.contains(id)) continue;
+                if (skip_first and !skipped) {
+                    skipped = true;
+                    log.info(
+                        "tmux window id={} mapped to current surface",
+                        .{id},
+                    );
+                    continue;
+                }
+                log.info("tmux: creating tab for window id={}", .{id});
+                _ = self.rt_app.performAction(
+                    .{ .surface = self },
+                    .new_tab,
+                    {},
+                ) catch |err| {
+                    log.warn(
+                        "tmux: failed to create tab for window id={}: {}",
+                        .{ id, err },
+                    );
+                };
+            }
+
+            // Update our tracked state.
+            self.tmux_window_ids.set(new_ids);
         },
     }
 }

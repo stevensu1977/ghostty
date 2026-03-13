@@ -109,11 +109,18 @@ pub const Message = union(enum) {
     search_selected: ?usize,
 
     /// The tmux control mode viewer has updated its window list.
-    /// The value is the number of tmux windows in the session.
+    /// Contains the IDs of all tmux windows in the current session.
     tmux_windows_changed: TmuxWindowsChanged,
 
     pub const TmuxWindowsChanged = struct {
-        window_count: u32,
+        /// Maximum number of tmux windows we can track in a single message.
+        pub const max_windows = 32;
+
+        /// The tmux window IDs in this session.
+        window_ids: [max_windows]u32 = .{0} ** max_windows,
+
+        /// The actual number of windows (length of valid entries in window_ids).
+        window_count: u32 = 0,
     };
 
     pub const ReportTitleStyle = enum {

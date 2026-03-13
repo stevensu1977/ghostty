@@ -444,20 +444,27 @@ pub const StreamHandler = struct {
                         },
 
                         .windows => |windows| {
+                            const TmuxMsg = apprt.surface.Message.TmuxWindowsChanged;
+                            const max = TmuxMsg.max_windows;
+                            const count: u32 = @intCast(@min(windows.len, max));
+
                             log.info(
                                 "tmux windows changed: count={}",
                                 .{windows.len},
                             );
-                            for (windows) |window| {
+
+                            var msg: TmuxMsg = .{
+                                .window_count = count,
+                            };
+                            for (windows[0..count], 0..count) |window, i| {
                                 log.info(
                                     "  tmux window id={} size={}x{}",
                                     .{ window.id, window.width, window.height },
                                 );
+                                msg.window_ids[i] = @intCast(window.id);
                             }
                             self.surfaceMessageWriter(.{
-                                .tmux_windows_changed = .{
-                                    .window_count = @intCast(windows.len),
-                                },
+                                .tmux_windows_changed = msg,
                             });
                         },
                     }
