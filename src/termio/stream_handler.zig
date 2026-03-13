@@ -443,8 +443,22 @@ pub const StreamHandler = struct {
                             ));
                         },
 
-                        .windows => {
-                            // TODO
+                        .windows => |windows| {
+                            log.info(
+                                "tmux windows changed: count={}",
+                                .{windows.len},
+                            );
+                            for (windows) |window| {
+                                log.info(
+                                    "  tmux window id={} size={}x{}",
+                                    .{ window.id, window.width, window.height },
+                                );
+                            }
+                            self.surfaceMessageWriter(.{
+                                .tmux_windows_changed = .{
+                                    .window_count = @intCast(windows.len),
+                                },
+                            });
                         },
                     }
                 }

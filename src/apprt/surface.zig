@@ -108,6 +108,14 @@ pub const Message = union(enum) {
     /// Selected search index change
     search_selected: ?usize,
 
+    /// The tmux control mode viewer has updated its window list.
+    /// The value is the number of tmux windows in the session.
+    tmux_windows_changed: TmuxWindowsChanged,
+
+    pub const TmuxWindowsChanged = struct {
+        window_count: u32,
+    };
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 

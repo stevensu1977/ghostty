@@ -1149,6 +1149,13 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 .{ .selected = v },
             );
         },
+
+        .tmux_windows_changed => |info| {
+            log.info(
+                "tmux control mode: {} window(s) in session",
+                .{info.window_count},
+            );
+        },
     }
 }
 
