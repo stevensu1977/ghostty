@@ -1195,6 +1195,37 @@ command: ?Command = null,
 ///     manually.
 @"initial-command": ?Command = null,
 
+/// Connect to a remote host and attach to a tmux session via tmux control
+/// mode (`tmux -CC`). When set, Ghostty will SSH to the specified host
+/// and run tmux in control mode, mapping tmux windows and panes to native
+/// Ghostty tabs and splits.
+///
+/// The value should be an SSH destination, e.g. `user@hostname` or just
+/// `hostname`. Any valid `ssh` destination syntax is accepted.
+///
+/// When this is set, the `command` configuration is ignored for surfaces
+/// created in tmux remote mode.
+///
+/// Example: `tmux-remote-host = user@myserver.com`
+@"tmux-remote-host": ?[:0]const u8 = null,
+
+/// The tmux session name to attach to on the remote host. If not set,
+/// defaults to "ghostty". The session is created if it does not already
+/// exist (using `new-session -A -s`).
+///
+/// This option only has effect when `tmux-remote-host` is set.
+///
+/// Example: `tmux-session = main`
+@"tmux-session": [:0]const u8 = @ptrCast("ghostty"),
+
+/// Whether to automatically reconnect when the tmux remote connection
+/// is lost (e.g. SSH disconnect, tmux server crash). When enabled,
+/// Ghostty will attempt to re-establish the connection after a brief
+/// delay.
+///
+/// This option only has effect when `tmux-remote-host` is set.
+@"tmux-reconnect": bool = false,
+
 /// Controls when command finished notifications are sent. There are
 /// three options:
 ///
