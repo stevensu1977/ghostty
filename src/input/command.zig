@@ -706,6 +706,7 @@ fn actionCommands(action: Action.Key) []const Command {
         .deactivate_all_key_tables,
         .end_key_sequence,
         .crash,
+        .connect_tmux_remote,
         => comptime &.{},
 
         // No commands because I'm not sure they make sense in a command

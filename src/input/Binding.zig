@@ -934,6 +934,13 @@ pub const Action = union(enum) {
     ///
     crash: CrashThread,
 
+    /// Connect to a remote tmux session via SSH in control mode.
+    ///
+    /// Opens a new tab that runs `ssh -t <host> tmux -CC new-session -A -s <session>`
+    /// using the `tmux-remote-host` and `tmux-session` config options.
+    /// Requires `tmux-remote-host` to be set in the configuration.
+    connect_tmux_remote,
+
     pub const Key = @typeInfo(Action).@"union".tag_type.?;
 
     /// Make this a valid gobject if we're in a GTK environment.
@@ -1370,6 +1377,7 @@ pub const Action = union(enum) {
             .deactivate_all_key_tables,
             .end_key_sequence,
             .crash,
+            .connect_tmux_remote,
             => .surface,
 
             // These are less obvious surface actions. They're surface

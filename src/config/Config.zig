@@ -1218,14 +1218,6 @@ command: ?Command = null,
 /// Example: `tmux-session = main`
 @"tmux-session": [:0]const u8 = @ptrCast("ghostty"),
 
-/// Whether to automatically reconnect when the tmux remote connection
-/// is lost (e.g. SSH disconnect, tmux server crash). When enabled,
-/// Ghostty will attempt to re-establish the connection after a brief
-/// delay.
-///
-/// This option only has effect when `tmux-remote-host` is set.
-@"tmux-reconnect": bool = false,
-
 /// Controls when command finished notifications are sent. There are
 /// three options:
 ///

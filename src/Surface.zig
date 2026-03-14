@@ -345,7 +345,8 @@ const DerivedConfig = struct {
     selection_word_chars: []const u21,
     vt_kam_allowed: bool,
     wait_after_command: bool,
-    tmux_reconnect: bool,
+    tmux_remote_host: ?[:0]const u8,
+    tmux_session: [:0]const u8,
     window_padding_top: u32,
     window_padding_bottom: u32,
     window_padding_left: u32,
@@ -424,7 +425,8 @@ const DerivedConfig = struct {
             .selection_word_chars = try alloc.dupe(u21, config.@"selection-word-chars".codepoints),
             .vt_kam_allowed = config.@"vt-kam-allowed",
             .wait_after_command = config.@"wait-after-command",
-            .tmux_reconnect = config.@"tmux-reconnect" and config.@"tmux-remote-host" != null,
+            .tmux_remote_host = config.@"tmux-remote-host",
+            .tmux_session = config.@"tmux-session",
             .window_padding_top = config.@"window-padding-y".top_left,
             .window_padding_bottom = config.@"window-padding-y".bottom_right,
             .window_padding_left = config.@"window-padding-x".top_left,
@@ -633,22 +635,8 @@ pub fn init(
         .config_conditional_state = app.config_conditional_state,
     };
 
-    // The command we're going to execute. If tmux-remote-host is set,
-    // construct an SSH+tmux command instead of using the normal command.
+    // The command we're going to execute.
     const command: ?configpkg.Command = command: {
-        if (config.@"tmux-remote-host") |host| {
-            const session = config.@"tmux-session";
-            log.info(
-                "tmux remote mode: host={s} session={s}",
-                .{ host, session },
-            );
-            // Build: ssh -t <host> tmux -CC new-session -A -s <session>
-            // shell: prefix means Exec will pass it to /bin/sh -c
-            const cmd = std.fmt.allocPrintSentinel(alloc, "ssh -t {s} tmux -CC new-session -A -s {s}", .{
-                host, session,
-            }, 0) catch break :command config.command;
-            break :command .{ .shell = cmd };
-        }
         if (app.first) {
             if (config.@"initial-command") |cmd| {
                 break :command cmd;
@@ -1367,22 +1355,6 @@ fn selectionScrollTick(self: *Surface) !void {
 fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
     // Mark our flag that we exited immediately
     self.child_exited = true;
-
-    // If tmux reconnect is enabled and this wasn't an immediate crash,
-    // create a new window (which will reconnect via tmux-remote-host config)
-    // and close this surface.
-    if (self.config.tmux_reconnect and info.runtime_ms > self.config.abnormal_command_exit_runtime_ms) {
-        log.info("tmux reconnect: creating new window to reconnect", .{});
-        _ = self.rt_app.performAction(
-            .{ .surface = self },
-            .new_window,
-            {},
-        ) catch |err| {
-            log.err("tmux reconnect: failed to create new window err={}", .{err});
-        };
-        self.close();
-        return;
-    }
 
     // If our runtime was below some threshold then we assume that this
     // was an abnormal exit and we show an error message.
@@ -6095,6 +6067,30 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             },
 
             .io => self.queueIo(.{ .crash = {} }, .unlocked),
+        },
+
+        .connect_tmux_remote => {
+            const host = self.config.tmux_remote_host orelse {
+                log.warn("connect_tmux_remote: tmux-remote-host not configured", .{});
+                return true;
+            };
+            const session = self.config.tmux_session;
+            log.info("connect_tmux_remote: host={s} session={s}", .{ host, session });
+
+            // Build the SSH+tmux command and write it to the current surface's terminal.
+            // This sends the command to the shell running in this surface.
+            var buf: [512]u8 = undefined;
+            var writer: std.Io.Writer = .fixed(&buf);
+            writer.print("ssh -t {s} tmux -CC new-session -A -s {s}\n", .{
+                host, session,
+            }) catch {
+                log.warn("connect_tmux_remote: command too long", .{});
+                return true;
+            };
+            self.queueIo(try termio.Message.writeReq(
+                self.alloc,
+                buf[0..writer.end],
+            ), .unlocked);
         },
 
         .adjust_selection => |direction| {
