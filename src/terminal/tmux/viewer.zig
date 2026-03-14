@@ -211,6 +211,12 @@ pub const Viewer = struct {
         /// never reuses window IDs within a server process lifetime.
         windows: []const Window,
 
+        /// A window was renamed. The caller should update tab titles.
+        window_renamed: struct {
+            window_id: usize,
+            name: []const u8,
+        },
+
         pub fn format(self: Action, writer: *std.Io.Writer) !void {
             const T = Action;
             const info = @typeInfo(T).@"union";
@@ -522,8 +528,17 @@ pub const Viewer = struct {
             // care.
             .sessions_changed => {},
 
-            // We don't use window names for anything, currently.
-            .window_renamed => {},
+            // Forward window rename to the caller for tab title updates.
+            .window_renamed => |info| {
+                var arena = self.action_arena.promote(self.alloc);
+                defer self.action_arena = arena.state;
+                actions.append(arena.allocator(), .{
+                    .window_renamed = .{
+                        .window_id = info.id,
+                        .name = info.name,
+                    },
+                }) catch return self.defunct();
+            },
 
             // This is for other clients, which we don't do anything about.
             // For us, we'll get `exit` or `session_changed`, respectively.

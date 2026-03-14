@@ -1212,14 +1212,13 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             const skip_first_pane = self.tmux_window_ids.count == 0;
             var first_pane_skipped = false;
 
+            const TmuxMsg = apprt.surface.Message.TmuxWindowsChanged;
             for (new_ids, 0..info.window_count) |id, win_idx| {
                 if (self.tmux_window_ids.contains(id)) continue;
 
-                const pane_ids = info.windowPaneIds(win_idx);
-                const pane_fds = info.windowPaneReadFds(win_idx);
+                const panes = info.windowPaneSlice(win_idx);
 
-                // Create a tab for each pane in this window.
-                for (pane_ids, pane_fds) |pane_id, read_fd| {
+                for (panes.ids, panes.fds, panes.dirs) |pane_id, read_fd, split_dir| {
                     // Skip the very first pane — it uses the current surface.
                     if (skip_first_pane and !first_pane_skipped) {
                         first_pane_skipped = true;
@@ -1237,34 +1236,83 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                             .origin_mailbox = info.origin_mailbox.?,
                             .origin_renderer_mutex = info.origin_renderer_mutex,
                         };
-                        log.info(
-                            "tmux: creating tab for window id={} pane={} (TmuxPane backend)",
-                            .{ id, pane_id },
-                        );
-                    } else {
-                        log.info("tmux: creating tab for window id={} pane={} (no pipe)", .{ id, pane_id });
                     }
 
-                    _ = self.rt_app.performAction(
-                        .{ .surface = self },
-                        .new_tab,
-                        {},
-                    ) catch |err| {
-                        if (self.app.pending_tmux_pane) |pending| {
-                            std.posix.close(pending.read_fd);
-                            self.app.pending_tmux_pane = null;
-                        }
-                        log.warn(
-                            "tmux: failed to create tab for window id={} pane={}: {}",
-                            .{ id, pane_id, err },
+                    // Determine whether to create a tab or a split.
+                    const is_split = split_dir == .right or split_dir == .down;
+                    if (is_split) {
+                        const direction: apprt.action.SplitDirection = switch (split_dir) {
+                            .right => .right,
+                            .down => .down,
+                            .none => unreachable,
+                        };
+                        log.info(
+                            "tmux: creating split ({s}) for window id={} pane={}",
+                            .{ @tagName(direction), id, pane_id },
                         );
-                    };
+                        _ = self.rt_app.performAction(
+                            .{ .surface = self },
+                            .new_split,
+                            direction,
+                        ) catch |err| {
+                            self.cleanupPendingTmuxPane();
+                            log.warn(
+                                "tmux: failed to create split for pane={}: {}",
+                                .{ pane_id, err },
+                            );
+                        };
+                    } else {
+                        log.info(
+                            "tmux: creating tab for window id={} pane={}",
+                            .{ id, pane_id },
+                        );
+                        _ = self.rt_app.performAction(
+                            .{ .surface = self },
+                            .new_tab,
+                            {},
+                        ) catch |err| {
+                            self.cleanupPendingTmuxPane();
+                            log.warn(
+                                "tmux: failed to create tab for pane={}: {}",
+                                .{ pane_id, err },
+                            );
+                        };
+                    }
                 }
             }
+
+            _ = TmuxMsg; // used for type access above
 
             // Update our tracked state.
             self.tmux_window_ids.set(new_ids);
         },
+
+        .tmux_window_renamed => |info| {
+            const name = std.mem.sliceTo(&info.name, 0);
+            log.info(
+                "tmux window renamed: id={} name=\"{s}\"",
+                .{ info.window_id, name },
+            );
+
+            // Set the tab title on the originating surface.
+            // TODO: when we have a window_id → surface mapping, target
+            // the specific surface for that window.
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .set_title,
+                .{ .title = name },
+            ) catch |err| {
+                log.warn("failed to set tab title for tmux window rename: {}", .{err});
+            };
+        },
+    }
+}
+
+/// Clean up pending tmux pane state when tab/split creation fails.
+fn cleanupPendingTmuxPane(self: *Surface) void {
+    if (self.app.pending_tmux_pane) |pending| {
+        std.posix.close(pending.read_fd);
+        self.app.pending_tmux_pane = null;
     }
 }
 

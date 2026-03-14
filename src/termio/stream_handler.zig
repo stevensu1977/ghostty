@@ -578,12 +578,16 @@ pub const StreamHandler = struct {
                             for (windows[0..count], 0..count) |window, i| {
                                 msg.window_ids[i] = @intCast(window.id);
 
-                                // Collect all pane IDs from the layout tree.
+                                // Collect all pane IDs and split directions
+                                // from the layout tree.
+                                const remaining = max_panes - pane_offset;
                                 var pane_count: u8 = 0;
-                                collectPaneIds(
+                                collectPaneLayout(
                                     window.layout,
-                                    msg.pane_ids[pane_offset..@min(pane_offset + (max_panes - pane_offset), max_panes)],
+                                    msg.pane_ids[pane_offset..][0..remaining],
+                                    msg.pane_split_dirs[pane_offset..][0..remaining],
                                     &pane_count,
+                                    .none,
                                 );
 
                                 log.info(
@@ -618,6 +622,24 @@ pub const StreamHandler = struct {
 
                             self.surfaceMessageWriter(.{
                                 .tmux_windows_changed = msg,
+                            });
+                        },
+
+                        .window_renamed => |info| {
+                            log.info(
+                                "tmux window renamed: id={} name=\"{s}\"",
+                                .{ info.window_id, info.name },
+                            );
+                            self.surfaceMessageWriter(.{
+                                .tmux_window_renamed = .{
+                                    .window_id = @intCast(info.window_id),
+                                    .name = name: {
+                                        var buf: [63:0]u8 = @splat(0);
+                                        const len = @min(info.name.len, 63);
+                                        @memcpy(buf[0..len], info.name[0..len]);
+                                        break :name buf;
+                                    },
+                                },
                             });
                         },
                     }
@@ -1723,19 +1745,39 @@ pub const StreamHandler = struct {
         self.surfaceMessageWriter(.{ .progress_report = report });
     }
 
-    /// Collect all pane IDs from a tmux layout tree (depth-first).
-    fn collectPaneIds(layout: terminal.tmux.Layout, out: []u32, count: *u8) void {
+    const SplitDir = apprt.surface.Message.TmuxWindowsChanged.SplitDir;
+
+    /// Collect pane IDs and split directions from a tmux layout tree.
+    /// For flat layouts (all children are panes), produces correct split
+    /// directions. For nested layouts, panes are flattened into tabs
+    /// (split_dir = .none for each sub-group's first pane).
+    fn collectPaneLayout(
+        layout: terminal.tmux.Layout,
+        out_ids: []u32,
+        out_dirs: []SplitDir,
+        count: *u8,
+        parent_dir: SplitDir,
+    ) void {
         switch (layout.content) {
             .pane => |id| {
-                if (count.* < out.len) {
-                    out[count.*] = @intCast(id);
+                if (count.* < out_ids.len) {
+                    out_ids[count.*] = @intCast(id);
+                    out_dirs[count.*] = parent_dir;
                     count.* += 1;
                 }
             },
-            .horizontal, .vertical => |children| {
-                for (children) |child| {
-                    if (count.* >= out.len) return;
-                    collectPaneIds(child, out, count);
+            .horizontal => |children| {
+                for (children, 0..) |child, ci| {
+                    if (count.* >= out_ids.len) return;
+                    const dir: SplitDir = if (ci == 0) parent_dir else .right;
+                    collectPaneLayout(child, out_ids, out_dirs, count, dir);
+                }
+            },
+            .vertical => |children| {
+                for (children, 0..) |child, ci| {
+                    if (count.* >= out_ids.len) return;
+                    const dir: SplitDir = if (ci == 0) parent_dir else .down;
+                    collectPaneLayout(child, out_ids, out_dirs, count, dir);
                 }
             },
         }
