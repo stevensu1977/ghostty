@@ -413,6 +413,22 @@ pub const StreamHandler = struct {
                 assert(tmux != .enter);
                 assert(tmux != .exit);
 
+                // Forward tmux pane output to the surface's terminal
+                // so it gets rendered on screen. The Viewer also processes
+                // this data into its per-pane terminals, but we need the
+                // surface terminal to display it.
+                switch (tmux) {
+                    .output => |out| {
+                        var tmux_vt = self.terminal.vtStream();
+                        defer tmux_vt.deinit();
+                        tmux_vt.nextSlice(out.data) catch |err| {
+                            log.warn("failed to forward tmux output to terminal: {}", .{err});
+                        };
+                        self.queueRender() catch {};
+                    },
+                    else => {},
+                }
+
                 const viewer = self.tmux_viewer orelse {
                     // This can only really happen if we failed to
                     // initialize the viewer on enter.
