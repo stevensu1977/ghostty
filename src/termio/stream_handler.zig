@@ -93,7 +93,7 @@ pub const StreamHandler = struct {
     pub const tmux_enabled = terminal.options.tmux_control_mode;
 
     const TmuxPanePipes = struct {
-        const max_panes = apprt.surface.Message.TmuxWindowsChanged.max_windows;
+        const max_panes = apprt.surface.Message.TmuxWindowsChanged.max_panes;
 
         const Entry = struct {
             pane_id: u32 = 0,

@@ -21,12 +21,8 @@ const crash = @import("../crash/main.zig");
 const log = std.log.scoped(.io_tmux_pane);
 
 /// The pipe fd used to receive tmux pane output.
-/// The Viewer writes to the other end of this pipe.
+/// The write end is owned by the stream_handler's TmuxPanePipes.
 output_read_fd: posix.fd_t,
-
-/// The pipe fd the Viewer writes pane output to.
-/// Stored here so we can close it on deinit.
-output_write_fd: posix.fd_t,
 
 /// The tmux pane ID this backend is associated with.
 pane_id: u32,
@@ -46,7 +42,6 @@ pub fn init(
 ) !TmuxPane {
     return .{
         .output_read_fd = cfg.output_read_fd,
-        .output_write_fd = cfg.output_write_fd,
         .pane_id = cfg.pane_id,
         .origin_mailbox = cfg.origin_mailbox,
         .origin_renderer_mutex = cfg.origin_renderer_mutex,
@@ -54,8 +49,6 @@ pub fn init(
 }
 
 pub fn deinit(self: *TmuxPane) void {
-    // Close our end of the output pipe. The write end is owned
-    // by whoever created us (the stream_handler).
     posix.close(self.output_read_fd);
     self.* = undefined;
 }
@@ -227,9 +220,6 @@ pub fn childExitedAbnormally(
 pub const Config = struct {
     /// The read end of the pipe for receiving tmux pane output.
     output_read_fd: posix.fd_t,
-
-    /// The write end of the pipe (kept for lifecycle management).
-    output_write_fd: posix.fd_t,
 
     /// The tmux pane ID.
     pane_id: u32,

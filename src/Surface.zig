@@ -674,7 +674,6 @@ pub fn init(
                 );
                 var io_tmux = try termio.TmuxPane.init(alloc, .{
                     .output_read_fd = setup.read_fd,
-                    .output_write_fd = -1, // write end owned by stream_handler
                     .pane_id = setup.pane_id,
                     .origin_mailbox = setup.origin_mailbox,
                     .origin_renderer_mutex = setup.origin_renderer_mutex,
@@ -1223,11 +1222,6 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
 
             const new_ids = info.window_ids[0..info.window_count];
 
-            // On the very first event, the first pane of the first
-            // new window maps to the current surface (skip creating a tab).
-            const skip_first_pane = self.tmux_window_ids.count == 0;
-            var first_pane_skipped = false;
-
             for (new_ids, 0..info.window_count) |id, win_idx| {
                 const is_new_window = !self.tmux_window_ids.contains(id);
                 const panes = info.windowPaneSlice(win_idx);
@@ -1236,17 +1230,7 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                     // Panes with read_fd == -1 already have surfaces (pipe
                     // was created in a prior event). Only create surfaces
                     // for panes with new pipes.
-                    if (read_fd == -1) {
-                        // Skip the very first pane — it uses the current surface.
-                        if (skip_first_pane and !first_pane_skipped) {
-                            first_pane_skipped = true;
-                            log.info(
-                                "tmux window id={} pane={} mapped to current surface",
-                                .{ id, pane_id },
-                            );
-                        }
-                        continue;
-                    }
+                    if (read_fd == -1) continue;
 
                     if (info.origin_mailbox != null) {
                         self.app.pending_tmux_pane = .{
