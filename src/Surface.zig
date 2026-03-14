@@ -1228,24 +1228,27 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             const skip_first_pane = self.tmux_window_ids.count == 0;
             var first_pane_skipped = false;
 
-            const TmuxMsg = apprt.surface.Message.TmuxWindowsChanged;
             for (new_ids, 0..info.window_count) |id, win_idx| {
-                if (self.tmux_window_ids.contains(id)) continue;
-
+                const is_new_window = !self.tmux_window_ids.contains(id);
                 const panes = info.windowPaneSlice(win_idx);
 
                 for (panes.ids, panes.fds, panes.dirs) |pane_id, read_fd, split_dir| {
-                    // Skip the very first pane — it uses the current surface.
-                    if (skip_first_pane and !first_pane_skipped) {
-                        first_pane_skipped = true;
-                        log.info(
-                            "tmux window id={} pane={} mapped to current surface",
-                            .{ id, pane_id },
-                        );
+                    // Panes with read_fd == -1 already have surfaces (pipe
+                    // was created in a prior event). Only create surfaces
+                    // for panes with new pipes.
+                    if (read_fd == -1) {
+                        // Skip the very first pane — it uses the current surface.
+                        if (skip_first_pane and !first_pane_skipped) {
+                            first_pane_skipped = true;
+                            log.info(
+                                "tmux window id={} pane={} mapped to current surface",
+                                .{ id, pane_id },
+                            );
+                        }
                         continue;
                     }
 
-                    if (read_fd != -1 and info.origin_mailbox != null) {
+                    if (info.origin_mailbox != null) {
                         self.app.pending_tmux_pane = .{
                             .pane_id = pane_id,
                             .read_fd = read_fd,
@@ -1255,12 +1258,12 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                     }
 
                     // Determine whether to create a tab or a split.
+                    // New windows get tabs; panes within a window get splits.
                     const is_split = split_dir == .right or split_dir == .down;
-                    if (is_split) {
+                    if (is_split or !is_new_window) {
                         const direction: apprt.action.SplitDirection = switch (split_dir) {
                             .right => .right,
-                            .down => .down,
-                            .none => unreachable,
+                            .down, .none => .down,
                         };
                         log.info(
                             "tmux: creating split ({s}) for window id={} pane={}",
@@ -1296,8 +1299,6 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                     }
                 }
             }
-
-            _ = TmuxMsg; // used for type access above
 
             // Update our tracked state.
             self.tmux_window_ids.set(new_ids);
