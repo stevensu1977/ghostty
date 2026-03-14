@@ -505,6 +505,13 @@ pub const Viewer = struct {
                 return self.defunct();
             },
 
+            // A window was closed. Refresh the window list so we
+            // emit a .windows action with the updated set.
+            .window_close => |info| self.windowClose(info.id) catch {
+                log.warn("failed to handle window close, becoming defunct", .{});
+                return self.defunct();
+            },
+
             // The active pane changed. We don't care about this because
             // we handle our own focus.
             .window_pane_changed => {},
@@ -617,6 +624,16 @@ pub const Viewer = struct {
         _ = window_id; // We refresh all windows via list-windows
 
         // Queue list-windows to get the updated window list
+        try self.queueCommands(&.{.list_windows});
+    }
+
+    /// When a window is closed, refresh the window list so the caller
+    /// gets an updated `.windows` action and can remove the corresponding tab.
+    fn windowClose(
+        self: *Viewer,
+        window_id: usize,
+    ) !void {
+        _ = window_id; // We refresh all windows via list-windows
         try self.queueCommands(&.{.list_windows});
     }
 

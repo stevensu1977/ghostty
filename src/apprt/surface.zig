@@ -9,6 +9,7 @@ const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 const Config = @import("../config.zig").Config;
 const MessageData = @import("../datastruct/main.zig").MessageData;
+const termio = @import("../termio.zig");
 
 /// The message types that can be sent to a single surface.
 pub const Message = union(enum) {
@@ -116,11 +117,48 @@ pub const Message = union(enum) {
         /// Maximum number of tmux windows we can track in a single message.
         pub const max_windows = 32;
 
+        /// Maximum total panes across all windows in a single message.
+        pub const max_panes = 48;
+
         /// The tmux window IDs in this session.
         window_ids: [max_windows]u32 = .{0} ** max_windows,
 
-        /// The actual number of windows (length of valid entries in window_ids).
+        /// The actual number of windows (length of valid entries).
         window_count: u32 = 0,
+
+        /// Flat array of all panes across all windows.
+        /// Panes for window 0 come first, then window 1, etc.
+        pane_ids: [max_panes]u32 = .{0} ** max_panes,
+        pane_read_fds: [max_panes]std.posix.fd_t = @splat(@as(std.posix.fd_t, -1)),
+
+        /// Number of panes per window (index matches window_ids).
+        window_pane_counts: [max_windows]u8 = .{0} ** max_windows,
+
+        /// Total number of panes in the flat array.
+        pane_count: u32 = 0,
+
+        /// The originating Surface's termio mailbox, used by TmuxPane
+        /// backends to send commands (send-keys, resize-pane) back.
+        origin_mailbox: ?*termio.Mailbox = null,
+
+        /// The renderer state mutex from the originating Surface.
+        origin_renderer_mutex: ?*std.Thread.Mutex = null,
+
+        /// Get the slice of pane IDs for a given window index.
+        pub fn windowPaneIds(self: *const TmuxWindowsChanged, win_idx: usize) []const u32 {
+            var offset: u32 = 0;
+            for (self.window_pane_counts[0..win_idx]) |c| offset += c;
+            const count = self.window_pane_counts[win_idx];
+            return self.pane_ids[offset..][0..count];
+        }
+
+        /// Get the slice of pane read fds for a given window index.
+        pub fn windowPaneReadFds(self: *const TmuxWindowsChanged, win_idx: usize) []const std.posix.fd_t {
+            var offset: u32 = 0;
+            for (self.window_pane_counts[0..win_idx]) |c| offset += c;
+            const count = self.window_pane_counts[win_idx];
+            return self.pane_read_fds[offset..][0..count];
+        }
     };
 
     pub const ReportTitleStyle = enum {

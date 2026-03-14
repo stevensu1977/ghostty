@@ -69,6 +69,21 @@ config_conditional_state: configpkg.ConditionalState,
 /// if they are the first surface.
 first: bool = true,
 
+/// When set, the next Surface.init should create a TmuxPane backend
+/// instead of an Exec backend. This is set by Surface.handleMessage
+/// before calling performAction(.new_tab) and consumed by Surface.init.
+/// This works because both run on the main thread.
+pending_tmux_pane: ?TmuxPaneSetup = null,
+
+pub const TmuxPaneSetup = struct {
+    pane_id: u32,
+    read_fd: std.posix.fd_t,
+    origin_mailbox: *termio.Mailbox,
+    origin_renderer_mutex: ?*std.Thread.Mutex,
+};
+
+const termio = @import("termio.zig");
+
 pub const CreateError = Allocator.Error || font.SharedGridSet.InitError;
 
 /// Create a new app instance. This returns a stable pointer to the app

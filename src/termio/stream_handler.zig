@@ -73,6 +73,11 @@ pub const StreamHandler = struct {
     /// The tmux control mode viewer state.
     tmux_viewer: if (tmux_enabled) ?*terminal.tmux.Viewer else void = if (tmux_enabled) null else {},
 
+    /// Pipe write fds for forwarding tmux pane output.
+    /// Each entry maps a pane ID to the write end of a pipe
+    /// that feeds a TmuxPane backend in another Surface.
+    tmux_pane_pipes: if (tmux_enabled) TmuxPanePipes else void = if (tmux_enabled) .{} else {},
+
     /// This is set to true when a message was written to the termio
     /// mailbox. This can be used by callers to determine if they need
     /// to wake up the termio thread.
@@ -87,14 +92,89 @@ pub const StreamHandler = struct {
     /// True if we have tmux control mode built in.
     pub const tmux_enabled = terminal.options.tmux_control_mode;
 
+    const TmuxPanePipes = struct {
+        const max_panes = apprt.surface.Message.TmuxWindowsChanged.max_windows;
+
+        const Entry = struct {
+            pane_id: u32 = 0,
+            write_fd: posix.fd_t = -1,
+        };
+
+        entries: [max_panes]Entry = @splat(Entry{}),
+        count: u32 = 0,
+
+        fn getWriteFd(self: *const TmuxPanePipes, pane_id: u32) ?posix.fd_t {
+            for (self.entries[0..self.count]) |e| {
+                if (e.pane_id == pane_id and e.write_fd != -1)
+                    return e.write_fd;
+            }
+            return null;
+        }
+
+        fn add(self: *TmuxPanePipes, pane_id: u32, write_fd: posix.fd_t) void {
+            if (self.count >= max_panes) return;
+            self.entries[self.count] = .{
+                .pane_id = pane_id,
+                .write_fd = write_fd,
+            };
+            self.count += 1;
+        }
+
+        /// Close pipes for panes that are NOT in the given active set.
+        /// This causes the TmuxPane read thread to see HUP and exit,
+        /// which triggers child_exited → surface close.
+        fn closeRemovedPanes(self: *TmuxPanePipes, active_pane_ids: []const u32) void {
+            var i: u32 = 0;
+            while (i < self.count) {
+                const e = &self.entries[i];
+                if (e.write_fd == -1) {
+                    i += 1;
+                    continue;
+                }
+                // Check if this pane is still active.
+                var found = false;
+                for (active_pane_ids) |pid| {
+                    if (pid == e.pane_id) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    log.info("closing pipe for removed tmux pane {}", .{e.pane_id});
+                    posix.close(e.write_fd);
+                    // Compact: move last entry here.
+                    self.count -= 1;
+                    if (i < self.count) {
+                        self.entries[i] = self.entries[self.count];
+                    }
+                    // Don't increment i, re-check swapped entry.
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        fn deinitPipes(self: *TmuxPanePipes) void {
+            for (self.entries[0..self.count]) |*e| {
+                if (e.write_fd != -1) {
+                    posix.close(e.write_fd);
+                    e.write_fd = -1;
+                }
+            }
+            self.count = 0;
+        }
+    };
+
     pub fn deinit(self: *StreamHandler) void {
         self.apc.deinit();
         self.dcs.deinit();
-        if (comptime tmux_enabled) tmux: {
-            const viewer = self.tmux_viewer orelse break :tmux;
-            viewer.deinit();
-            self.alloc.destroy(viewer);
-            self.tmux_viewer = null;
+        if (comptime tmux_enabled) {
+            self.tmux_pane_pipes.deinitPipes();
+            if (self.tmux_viewer) |viewer| {
+                viewer.deinit();
+                self.alloc.destroy(viewer);
+                self.tmux_viewer = null;
+            }
         }
     }
 
@@ -413,18 +493,36 @@ pub const StreamHandler = struct {
                 assert(tmux != .enter);
                 assert(tmux != .exit);
 
-                // Forward tmux pane output to the surface's terminal
-                // so it gets rendered on screen. The Viewer also processes
-                // this data into its per-pane terminals, but we need the
-                // surface terminal to display it.
+                // Forward tmux pane output to the appropriate destination:
+                // - If the pane has a registered pipe, write to it (goes to
+                //   a TmuxPane backend in another Surface).
+                // - Otherwise, render it in the current surface's terminal.
                 switch (tmux) {
                     .output => |out| {
-                        var tmux_vt = self.terminal.vtStream();
-                        defer tmux_vt.deinit();
-                        tmux_vt.nextSlice(out.data) catch |err| {
-                            log.warn("failed to forward tmux output to terminal: {}", .{err});
-                        };
-                        self.queueRender() catch {};
+                        if (self.tmux_pane_pipes.getWriteFd(
+                            @intCast(out.pane_id),
+                        )) |write_fd| {
+                            // Write to the pipe for the TmuxPane backend.
+                            var remaining = out.data;
+                            while (remaining.len > 0) {
+                                const n = posix.write(write_fd, remaining) catch |err| {
+                                    log.warn(
+                                        "failed to write tmux output to pipe pane={}: {}",
+                                        .{ out.pane_id, err },
+                                    );
+                                    break;
+                                };
+                                remaining = remaining[n..];
+                            }
+                        } else {
+                            // No pipe; render in the current surface.
+                            var tmux_vt = self.terminal.vtStream();
+                            defer tmux_vt.deinit();
+                            tmux_vt.nextSlice(out.data) catch |err| {
+                                log.warn("failed to forward tmux output to terminal: {}", .{err});
+                            };
+                            self.queueRender() catch {};
+                        }
                     },
                     else => {},
                 }
@@ -461,8 +559,9 @@ pub const StreamHandler = struct {
 
                         .windows => |windows| {
                             const TmuxMsg = apprt.surface.Message.TmuxWindowsChanged;
-                            const max = TmuxMsg.max_windows;
-                            const count: u32 = @intCast(@min(windows.len, max));
+                            const max_win = TmuxMsg.max_windows;
+                            const max_panes = TmuxMsg.max_panes;
+                            const count: u32 = @intCast(@min(windows.len, max_win));
 
                             log.info(
                                 "tmux windows changed: count={}",
@@ -471,14 +570,52 @@ pub const StreamHandler = struct {
 
                             var msg: TmuxMsg = .{
                                 .window_count = count,
+                                .origin_mailbox = self.termio_mailbox,
+                                .origin_renderer_mutex = self.renderer_state.mutex,
                             };
+
+                            var pane_offset: u32 = 0;
                             for (windows[0..count], 0..count) |window, i| {
-                                log.info(
-                                    "  tmux window id={} size={}x{}",
-                                    .{ window.id, window.width, window.height },
-                                );
                                 msg.window_ids[i] = @intCast(window.id);
+
+                                // Collect all pane IDs from the layout tree.
+                                var pane_count: u8 = 0;
+                                collectPaneIds(
+                                    window.layout,
+                                    msg.pane_ids[pane_offset..@min(pane_offset + (max_panes - pane_offset), max_panes)],
+                                    &pane_count,
+                                );
+
+                                log.info(
+                                    "  tmux window id={} size={}x{} panes={}",
+                                    .{ window.id, window.width, window.height, pane_count },
+                                );
+
+                                // Create pipes for each pane.
+                                for (0..pane_count) |p| {
+                                    const pid = msg.pane_ids[pane_offset + p];
+                                    if (self.tmux_pane_pipes.getWriteFd(pid) == null) {
+                                        const pipe = internal_os.pipe() catch |err| {
+                                            log.warn("failed to create pipe for tmux pane {}: {}", .{ pid, err });
+                                            continue;
+                                        };
+                                        self.tmux_pane_pipes.add(pid, pipe[1]);
+                                        msg.pane_read_fds[pane_offset + p] = pipe[0];
+                                    }
+                                }
+
+                                msg.window_pane_counts[i] = pane_count;
+                                pane_offset += pane_count;
                             }
+                            msg.pane_count = pane_offset;
+
+                            // Close write-end pipes for panes no longer in
+                            // the window list. This causes TmuxPane read threads
+                            // to see HUP → child_exited → surface closes.
+                            self.tmux_pane_pipes.closeRemovedPanes(
+                                msg.pane_ids[0..pane_offset],
+                            );
+
                             self.surfaceMessageWriter(.{
                                 .tmux_windows_changed = msg,
                             });
@@ -1584,5 +1721,23 @@ pub const StreamHandler = struct {
     /// Display a GUI progress report.
     fn progressReport(self: *StreamHandler, report: terminal.osc.Command.ProgressReport) void {
         self.surfaceMessageWriter(.{ .progress_report = report });
+    }
+
+    /// Collect all pane IDs from a tmux layout tree (depth-first).
+    fn collectPaneIds(layout: terminal.tmux.Layout, out: []u32, count: *u8) void {
+        switch (layout.content) {
+            .pane => |id| {
+                if (count.* < out.len) {
+                    out[count.*] = @intCast(id);
+                    count.* += 1;
+                }
+            },
+            .horizontal, .vertical => |children| {
+                for (children) |child| {
+                    if (count.* >= out.len) return;
+                    collectPaneIds(child, out, count);
+                }
+            },
+        }
     }
 };

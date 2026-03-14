@@ -3,8 +3,8 @@
 //! Unlike the Exec backend, this backend does not spawn a subprocess or
 //! allocate a PTY. Instead, it reads terminal output from a pipe that is
 //! fed by the tmux Viewer (running in another Surface's stream handler),
-//! and forwards user input back to tmux via a write-back pipe so the
-//! originating Surface can send `send-keys` commands.
+//! and forwards user input back to tmux via the originating Surface's
+//! termio mailbox so it can send commands to the tmux control mode connection.
 const TmuxPane = @This();
 
 const std = @import("std");
@@ -31,6 +31,15 @@ output_write_fd: posix.fd_t,
 /// The tmux pane ID this backend is associated with.
 pane_id: u32,
 
+/// The originating Surface's termio mailbox. We send tmux commands
+/// (send-keys, resize-pane) here so they get written to the tmux
+/// control mode connection (the PTY running `tmux -CC`).
+origin_mailbox: *termio.Mailbox,
+
+/// The renderer state mutex from the originating Surface, needed for
+/// the mailbox send slow path.
+origin_renderer_mutex: ?*std.Thread.Mutex,
+
 pub fn init(
     _: Allocator,
     cfg: Config,
@@ -39,6 +48,8 @@ pub fn init(
         .output_read_fd = cfg.output_read_fd,
         .output_write_fd = cfg.output_write_fd,
         .pane_id = cfg.pane_id,
+        .origin_mailbox = cfg.origin_mailbox,
+        .origin_renderer_mutex = cfg.origin_renderer_mutex,
     };
 }
 
@@ -97,9 +108,15 @@ pub fn focusGained(
     td: *termio.Termio.ThreadData,
     focused: bool,
 ) !void {
-    _ = self;
     _ = td;
-    _ = focused;
+    if (!focused) return;
+
+    // Notify tmux which pane is now focused so the remote side
+    // stays in sync (e.g. for status bar, hooks, etc.).
+    var buf: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    writer.print("select-pane -t %{}\n", .{self.pane_id}) catch return;
+    self.sendToOrigin(buf[0..writer.end]);
 }
 
 pub fn resize(
@@ -107,10 +124,18 @@ pub fn resize(
     grid_size: renderer.GridSize,
     screen_size: renderer.ScreenSize,
 ) !void {
-    _ = self;
-    _ = grid_size;
     _ = screen_size;
-    // TODO: send tmux resize-pane command
+
+    // Format: resize-pane -t %<id> -x <cols> -y <rows>\n
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    writer.print("resize-pane -t %{} -x {} -y {}\n", .{
+        self.pane_id,
+        grid_size.columns,
+        grid_size.rows,
+    }) catch return;
+
+    self.sendToOrigin(buf[0..writer.end]);
 }
 
 pub fn queueWrite(
@@ -120,12 +145,69 @@ pub fn queueWrite(
     data: []const u8,
     linefeed: bool,
 ) !void {
-    _ = self;
-    _ = alloc;
     _ = td;
-    _ = data;
     _ = linefeed;
-    // TODO: forward as tmux send-keys to the originating surface
+
+    if (data.len == 0) return;
+
+    // Format: send-keys -t %<id> -H <hex bytes>\n
+    // Each input byte becomes a 2-char hex value separated by spaces.
+    // Max command overhead: "send-keys -t %4294967295 -H \n" = ~32 bytes
+    // Each data byte = 3 chars (2 hex + space). For safety, cap at
+    // a reasonable chunk size so we don't exceed stack buffers.
+    const chunk_size = 128;
+    var offset: usize = 0;
+    while (offset < data.len) {
+        const end = @min(offset + chunk_size, data.len);
+        const chunk = data[offset..end];
+
+        // Calculate needed buffer size:
+        // prefix + pane_id(max 10 digits) + hex data + newline
+        // "send-keys -t %" = 15, max pane_id = 10, " -H " = 4
+        // hex data: chunk.len * 3 (2 hex + space), newline = 1
+        const buf_size = 30 + chunk.len * 3 + 1;
+
+        if (buf_size <= 512) {
+            // Use stack buffer for small commands.
+            var buf: [512]u8 = undefined;
+            var writer: std.Io.Writer = .fixed(&buf);
+            self.formatSendKeys(&writer, chunk) catch continue;
+            self.sendToOrigin(buf[0..writer.end]);
+        } else {
+            // Use heap for larger commands.
+            var list: std.ArrayListAligned(u8, null) = .empty;
+            defer list.deinit(alloc);
+            var writer = list.writer(alloc).any();
+            self.formatSendKeys(&writer, chunk) catch continue;
+            self.sendToOrigin(list.items);
+        }
+
+        offset = end;
+    }
+}
+
+fn formatSendKeys(self: *TmuxPane, writer: anytype, data: []const u8) !void {
+    try writer.print("send-keys -t %{} -H", .{self.pane_id});
+    for (data) |byte| {
+        try writer.print(" {x:0>2}", .{byte});
+    }
+    try writer.writeByte('\n');
+}
+
+/// Send a tmux command to the originating Surface's termio mailbox.
+fn sendToOrigin(self: *TmuxPane, command: []const u8) void {
+    const msg = termio.Message.writeReq(
+        // We use undefined allocator because writeReq for small data
+        // uses write_small which doesn't allocate. For larger data
+        // it will use the allocator - but our commands should be small.
+        std.heap.page_allocator,
+        command,
+    ) catch |err| {
+        log.warn("failed to create tmux command writeReq: {}", .{err});
+        return;
+    };
+    self.origin_mailbox.send(msg, self.origin_renderer_mutex);
+    self.origin_mailbox.notify();
 }
 
 pub fn childExitedAbnormally(
@@ -151,6 +233,12 @@ pub const Config = struct {
 
     /// The tmux pane ID.
     pane_id: u32,
+
+    /// The originating Surface's termio mailbox for sending commands.
+    origin_mailbox: *termio.Mailbox,
+
+    /// The originating Surface's renderer state mutex.
+    origin_renderer_mutex: ?*std.Thread.Mutex,
 };
 
 pub const ThreadData = struct {
@@ -203,11 +291,13 @@ const ReadThread = struct {
                         error.InputOutput,
                         => {
                             log.info("tmux pane reader exiting", .{});
+                            notifyChildExited(io);
                             return;
                         },
                         error.WouldBlock => break,
                         else => {
                             log.err("tmux pane reader error err={}", .{err});
+                            notifyChildExited(io);
                             return;
                         },
                     }
@@ -219,6 +309,7 @@ const ReadThread = struct {
 
             _ = posix.poll(&pollfds, -1) catch |err| {
                 log.warn("poll failed on tmux pane read thread err={}", .{err});
+                notifyChildExited(io);
                 return;
             };
 
@@ -228,8 +319,20 @@ const ReadThread = struct {
             }
             if (pollfds[0].revents & posix.POLL.HUP != 0) {
                 log.info("tmux pane pipe closed, read thread exiting", .{});
+                notifyChildExited(io);
                 return;
             }
         }
+    }
+
+    /// Notify the surface that the tmux pane has "exited" (pipe closed).
+    /// This causes the surface to close, similar to a child process exit.
+    fn notifyChildExited(io: *termio.Termio) void {
+        _ = io.surface_mailbox.push(.{
+            .child_exited = .{
+                .exit_code = 0,
+                .runtime_ms = 0,
+            },
+        }, .{ .instant = {} });
     }
 };

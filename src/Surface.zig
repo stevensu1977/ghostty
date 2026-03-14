@@ -645,32 +645,56 @@ pub fn init(
     // This separate block ({}) is important because our errdefers must
     // be scoped here to be valid.
     {
-        var env = rt_surface.defaultTermioEnv() catch |err| env: {
-            // If an error occurs, we don't want to block surface startup.
-            log.warn("error getting env map for surface err={}", .{err});
-            break :env internal_os.getEnvMap(alloc) catch
-                std.process.EnvMap.init(alloc);
+        // Check if we should create a TmuxPane backend instead of Exec.
+        // This is set by handleMessage before calling performAction(.new_tab).
+        const tmux_pane_setup = app.pending_tmux_pane;
+        app.pending_tmux_pane = null;
+
+        const io_backend: termio.Backend = backend: {
+            if (tmux_pane_setup) |setup| {
+                log.info(
+                    "creating TmuxPane backend for pane_id={}",
+                    .{setup.pane_id},
+                );
+                var io_tmux = try termio.TmuxPane.init(alloc, .{
+                    .output_read_fd = setup.read_fd,
+                    .output_write_fd = -1, // write end owned by stream_handler
+                    .pane_id = setup.pane_id,
+                    .origin_mailbox = setup.origin_mailbox,
+                    .origin_renderer_mutex = setup.origin_renderer_mutex,
+                });
+                errdefer io_tmux.deinit();
+                break :backend .{ .tmux_pane = io_tmux };
+            } else {
+                var env = rt_surface.defaultTermioEnv() catch |err| env: {
+                    // If an error occurs, we don't want to block surface startup.
+                    log.warn("error getting env map for surface err={}", .{err});
+                    break :env internal_os.getEnvMap(alloc) catch
+                        std.process.EnvMap.init(alloc);
+                };
+                errdefer env.deinit();
+
+                // don't leak GHOSTTY_LOG to any subprocesses
+                env.remove("GHOSTTY_LOG");
+
+                // Initialize our IO backend
+                var io_exec = try termio.Exec.init(alloc, .{
+                    .command = command,
+                    .env = env,
+                    .env_override = config.env,
+                    .shell_integration = config.@"shell-integration",
+                    .shell_integration_features = config.@"shell-integration-features",
+                    .cursor_blink = config.@"cursor-style-blink",
+                    .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
+                    .resources_dir = global_state.resources_dir.host(),
+                    .term = config.term,
+                    .rt_pre_exec_info = .init(config),
+                    .rt_post_fork_info = .init(config),
+                });
+                errdefer io_exec.deinit();
+                break :backend .{ .exec = io_exec };
+            }
         };
-        errdefer env.deinit();
-
-        // don't leak GHOSTTY_LOG to any subprocesses
-        env.remove("GHOSTTY_LOG");
-
-        // Initialize our IO backend
-        var io_exec = try termio.Exec.init(alloc, .{
-            .command = command,
-            .env = env,
-            .env_override = config.env,
-            .shell_integration = config.@"shell-integration",
-            .shell_integration_features = config.@"shell-integration-features",
-            .cursor_blink = config.@"cursor-style-blink",
-            .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
-            .resources_dir = global_state.resources_dir.host(),
-            .term = config.term,
-            .rt_pre_exec_info = .init(config),
-            .rt_post_fork_info = .init(config),
-        });
-        errdefer io_exec.deinit();
 
         // Initialize our IO mailbox
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
@@ -680,7 +704,7 @@ pub fn init(
             .size = size,
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
-            .backend = .{ .exec = io_exec },
+            .backend = io_backend,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = render_thread.wakeup,
@@ -1177,47 +1201,65 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
 
         .tmux_windows_changed => |info| {
             log.info(
-                "tmux control mode: {} window(s) in session",
-                .{info.window_count},
+                "tmux control mode: {} window(s), {} pane(s) in session",
+                .{ info.window_count, info.pane_count },
             );
 
             const new_ids = info.window_ids[0..info.window_count];
 
-            // Count how many windows are new (not in our current set).
-            var new_count: u32 = 0;
-            for (new_ids) |id| {
-                if (!self.tmux_window_ids.contains(id)) {
-                    new_count += 1;
-                }
-            }
+            // On the very first event, the first pane of the first
+            // new window maps to the current surface (skip creating a tab).
+            const skip_first_pane = self.tmux_window_ids.count == 0;
+            var first_pane_skipped = false;
 
-            // Create a new tab for each new tmux window beyond the first
-            // one we've ever seen (the first window maps to the current
-            // surface). On the very first event our tracked count is 0
-            // so we skip the first new window.
-            const skip_first = self.tmux_window_ids.count == 0;
-            var skipped = false;
-            for (new_ids) |id| {
+            for (new_ids, 0..info.window_count) |id, win_idx| {
                 if (self.tmux_window_ids.contains(id)) continue;
-                if (skip_first and !skipped) {
-                    skipped = true;
-                    log.info(
-                        "tmux window id={} mapped to current surface",
-                        .{id},
-                    );
-                    continue;
+
+                const pane_ids = info.windowPaneIds(win_idx);
+                const pane_fds = info.windowPaneReadFds(win_idx);
+
+                // Create a tab for each pane in this window.
+                for (pane_ids, pane_fds) |pane_id, read_fd| {
+                    // Skip the very first pane — it uses the current surface.
+                    if (skip_first_pane and !first_pane_skipped) {
+                        first_pane_skipped = true;
+                        log.info(
+                            "tmux window id={} pane={} mapped to current surface",
+                            .{ id, pane_id },
+                        );
+                        continue;
+                    }
+
+                    if (read_fd != -1 and info.origin_mailbox != null) {
+                        self.app.pending_tmux_pane = .{
+                            .pane_id = pane_id,
+                            .read_fd = read_fd,
+                            .origin_mailbox = info.origin_mailbox.?,
+                            .origin_renderer_mutex = info.origin_renderer_mutex,
+                        };
+                        log.info(
+                            "tmux: creating tab for window id={} pane={} (TmuxPane backend)",
+                            .{ id, pane_id },
+                        );
+                    } else {
+                        log.info("tmux: creating tab for window id={} pane={} (no pipe)", .{ id, pane_id });
+                    }
+
+                    _ = self.rt_app.performAction(
+                        .{ .surface = self },
+                        .new_tab,
+                        {},
+                    ) catch |err| {
+                        if (self.app.pending_tmux_pane) |pending| {
+                            std.posix.close(pending.read_fd);
+                            self.app.pending_tmux_pane = null;
+                        }
+                        log.warn(
+                            "tmux: failed to create tab for window id={} pane={}: {}",
+                            .{ id, pane_id, err },
+                        );
+                    };
                 }
-                log.info("tmux: creating tab for window id={}", .{id});
-                _ = self.rt_app.performAction(
-                    .{ .surface = self },
-                    .new_tab,
-                    {},
-                ) catch |err| {
-                    log.warn(
-                        "tmux: failed to create tab for window id={}: {}",
-                        .{ id, err },
-                    );
-                };
             }
 
             // Update our tracked state.
